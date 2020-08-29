@@ -1,0 +1,131 @@
+diff a/components/driver/can.c b/components/driver/can.c	(rejected hunks)
+@@ -132,49 +122,10 @@ static inline void can_handle_recovery_complete(int *alert_req)
+ {
+     //Bus recovery complete.
+     assert(can_hal_handle_bus_recov_cplt(&can_context));
+-
+-    //Reset and set flags to the equivalent of the stopped state
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING | CTRL_FLAG_ERR_WARN |
+-                                             CTRL_FLAG_ERR_PASSIVE | CTRL_FLAG_BUS_OFF |
+-                                             CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+     can_alert_handler(CAN_ALERT_BUS_RECOVERED, alert_req);
+ }
+ 
+-static inline void can_handle_recovery_in_progress(int * alert_req)
+-{
+-    //Bus-recovery in progress. TEC has dropped below error warning limit
+-    can_alert_handler(CAN_ALERT_RECOVERY_IN_PROGRESS, alert_req);
+-}
+-
+-static inline void can_handle_above_ewl(int *alert_req)
+-{
+-    //TEC or REC surpassed error warning limit
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_ABOVE_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_below_ewl(int *alert_req)
+-{
+-    //TEC and REC are both below error warning
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_BELOW_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_error_passive(int *alert_req)
+-{
+-    //Entered error passive
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_PASS, alert_req);
+-}
+-
+-static inline void can_handle_error_active(int *alert_req)
+-{
+-    //Returned to error active
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_ACTIVE, alert_req);
+-}
+-
+ static inline void can_handle_bus_error(int *alert_req)
+ {
+     // ECC register is read to re-arm bus error interrupt. ECC is not used
+@@ -219,11 +182,14 @@ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert
+         p_can_obj->tx_failed_count++;
+         can_alert_handler(CAN_ALERT_TX_FAILED, alert_req);
+     }
+-
+     //Update TX message count
+     p_can_obj->tx_msg_count--;
+     assert(p_can_obj->tx_msg_count >= 0);     //Sanity check
+ 
++    if (can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_BUS_OFF)) {
++        //Can't transmit in bus off, return immediately
++        return;
++    }
+     //Check if there are more frames to transmit
+     if (p_can_obj->tx_msg_count > 0 && p_can_obj->tx_queue != NULL) {
+         can_hal_frame_t frame;
+@@ -460,17 +442,16 @@ esp_err_t can_start(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_STOPPED, ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_STOPPED, ESP_ERR_INVALID_STATE);
+ 
+     //Reset RX queue, and RX message count
+     xQueueReset(p_can_obj->rx_queue);
+     p_can_obj->rx_msg_count = 0;
+-    //Todo: Add assert to see if in reset mode. //Should already be in bus-off mode, set again to make sure
+ 
+     //Currently in listen only mode, need to set to mode specified by configuration
+     assert(can_hal_start(&can_context, p_can_obj->mode));
++    p_can_obj->driver_state = CAN_STATE_RUNNING;
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+     CAN_EXIT_CRITICAL();
+     return ESP_OK;
+ }
+@@ -480,18 +461,16 @@ esp_err_t can_stop(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_RUNNING, ESP_ERR_INVALID_STATE);
+ 
+     assert(can_hal_stop(&can_context));
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+-
+     //Reset TX Queue and message count
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+ 
+     CAN_EXIT_CRITICAL();
+ 
+@@ -619,19 +590,17 @@ esp_err_t can_initiate_recovery(void)
+     CAN_ENTER_CRITICAL();
+     //Check state
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_BUS_OFF, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & CTRL_FLAG_RECOVERING), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_BUS_OFF, ESP_ERR_INVALID_STATE);
+ 
+     //Reset TX Queue/Counters
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING);
+ 
+     //Trigger start of recovery process
+     assert(can_hal_start_bus_recovery(&can_context));
++    p_can_obj->driver_state = CAN_STATE_RECOVERING;
+     CAN_EXIT_CRITICAL();
+ 
+     return ESP_OK;

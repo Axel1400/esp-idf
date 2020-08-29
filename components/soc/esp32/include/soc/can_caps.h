@@ -28,7 +28,48 @@ extern "C" {
 #define CAN_BRP_IS_VALID(brp)       ((brp) >= 2 && (brp) <= 128 && ((brp) & 0x1) == 0)
 #endif
 
-//Todo: Add FIFO overrun errata workaround
+/* -------------------------- Errata Workarounds ---------------------------- */
+
+/**
+ * Errata: When a transmit interrupt occurs, and interrupt register is read on
+ * the same clock cycle, the transmit interrupt could be lost.
+ * Workaround: Check the STATUS_TRANSMIT_BUFFER bit each time the INTERRUPT_REG is read
+ */
+#define CAN_ERRATA_4_WORKAROUND             1
+
+/**
+ * Errata: Receiving an erroneous data frame can cause the data bytes of the next
+ * received data frame to be invalid.
+ * Workaround: Reset peripheral
+ */
+#define CAN_ERRATA_5_WORKAROUND             1
+
+/**
+ * Errata: When RX FIFO overruns and RX message counter maxes out (at 64 messages),
+ * any messages read from the RX buffer will be corrupt
+ * Workaround: Reset peripheral.
+ *
+ * Workaround threshold set at 63 to prevent failure of detecting errata condition
+ */
+#define CAN_ERRATA_10_WORKAROUND            1
+#define CAN_ERRATA_10_WORKAROUND_THRESHOLD  63
+
+/**
+ * Errata: When the release buffer command is set, and at the same APB clock cycle
+ * an overrun byte is written into the RX FIFO, the RX FIFO's internal byte counter
+ * will not be decremented by the release buffer command.
+ * Workaround: Enter and exit reset mode
+ */
+#define CAN_ERRATA_11_WORKAROUND            1
+
+/**
+ * Some errata workarounds will require a hardware reset of the peripheral, thus
+ * requires the peripheral's registers to be saved and restored.
+ */
+#if defined(CAN_ERRATA_10_WORKAROUND)
+#define CAN_ERRATA_HW_RESET_PERIPH          1
+#endif
+
 //Todo: Add ECC decode capabilities
 //Todo: Add ALC decode capability
 
