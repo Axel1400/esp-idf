@@ -1,0 +1,434 @@
+diff a/components/driver/can.c b/components/driver/can.c	(rejected hunks)
+@@ -44,20 +44,9 @@
+                 return ret_val;                                             \
+             }                                                               \
+ })
+-#define CAN_SET_FLAG(var, mask)     ((var) |= (mask))
+-#define CAN_RESET_FLAG(var, mask)   ((var) &= ~(mask))
+-#define CAN_TAG "CAN"
+ 
++#define CAN_TAG "CAN"
+ #define DRIVER_DEFAULT_INTERRUPTS   0xE7        //Exclude data overrun (bit[3]) and brp_div (bit[4])
+-
+-//Control flags
+-#define CTRL_FLAG_STOPPED           0x001       //CAN peripheral in stopped state
+-#define CTRL_FLAG_RECOVERING        0x002       //Bus is undergoing bus recovery
+-#define CTRL_FLAG_ERR_WARN          0x004       //TEC or REC is >= error warning limit
+-#define CTRL_FLAG_ERR_PASSIVE       0x008       //TEC or REC is >= 128
+-#define CTRL_FLAG_BUS_OFF           0x010       //Bus-off due to TEC >= 256
+-#define CTRL_FLAG_TX_BUFF_OCCUPIED  0x020       //Transmit buffer is occupied
+-
+ #define ALERT_LOG_LEVEL_WARNING     CAN_ALERT_ARB_LOST  //Alerts above and including this level use ESP_LOGW
+ #define ALERT_LOG_LEVEL_ERROR       CAN_ALERT_TX_FAILED //Alerts above and including this level use ESP_LOGE
+ 
+@@ -66,9 +55,10 @@
+ //Control structure for CAN driver
+ typedef struct {
+     //Control and status members
+-    uint32_t control_flags;
+     can_mode_t mode;
++    can_state_t driver_state;
+     uint32_t rx_missed_count;
++    uint32_t rx_overrun_count;
+     uint32_t tx_failed_count;
+     uint32_t arb_lost_count;
+     uint32_t bus_error_count;
+@@ -103,7 +93,7 @@ static void can_alert_handler(uint32_t alert_code, int *alert_req)
+ {
+     if (p_can_obj->alerts_enabled & alert_code) {
+         //Signify alert has occurred
+-        CAN_SET_FLAG(p_can_obj->alerts_triggered, alert_code);
++        p_can_obj->alerts_triggered |= alert_code;
+         *alert_req = 1;
+         if (p_can_obj->alerts_enabled & CAN_ALERT_AND_LOG) {
+             if (alert_code >= ALERT_LOG_LEVEL_ERROR) {
+@@ -120,11 +110,11 @@ static void can_alert_handler(uint32_t alert_code, int *alert_req)
+ static inline void can_handle_bus_off(int *alert_req)
+ {
+     //Bus-Off condition. TEC should set and held at 127, REC should be 0, reset mode entered
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_BUS_OFF);
+     /* Note: REC is still allowed to increase during bus-off. REC > err_warn
+        can prevent "bus recovery complete" interrupt from occurring. Set to
+        listen only mode to freeze REC. */
+     can_hal_handle_bus_off(&can_context);
++    p_can_obj->driver_state = CAN_STATE_BUS_OFF;
+     can_alert_handler(CAN_ALERT_BUS_OFF, alert_req);
+ }
+ 
+@@ -132,49 +122,10 @@ static inline void can_handle_recovery_complete(int *alert_req)
+ {
+     //Bus recovery complete.
+     assert(can_hal_handle_bus_recov_cplt(&can_context));
+-
+-    //Reset and set flags to the equivalent of the stopped state
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING | CTRL_FLAG_ERR_WARN |
+-                                             CTRL_FLAG_ERR_PASSIVE | CTRL_FLAG_BUS_OFF |
+-                                             CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+     can_alert_handler(CAN_ALERT_BUS_RECOVERED, alert_req);
+ }
+ 
+-static inline void can_handle_recovery_in_progress(int * alert_req)
+-{
+-    //Bus-recovery in progress. TEC has dropped below error warning limit
+-    can_alert_handler(CAN_ALERT_RECOVERY_IN_PROGRESS, alert_req);
+-}
+-
+-static inline void can_handle_above_ewl(int *alert_req)
+-{
+-    //TEC or REC surpassed error warning limit
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_ABOVE_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_below_ewl(int *alert_req)
+-{
+-    //TEC and REC are both below error warning
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_BELOW_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_error_passive(int *alert_req)
+-{
+-    //Entered error passive
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_PASS, alert_req);
+-}
+-
+-static inline void can_handle_error_active(int *alert_req)
+-{
+-    //Returned to error active
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_ACTIVE, alert_req);
+-}
+-
+ static inline void can_handle_bus_error(int *alert_req)
+ {
+     // ECC register is read to re-arm bus error interrupt. ECC is not used
+@@ -193,21 +144,33 @@ static inline void can_handle_arb_lost(int *alert_req)
+ 
+ static inline void can_handle_rx_buffer_frames(BaseType_t *task_woken, int *alert_req)
+ {
+-    uint32_t msg_count = can_hal_get_rx_msg_count(&can_context);
+-
+-    for (int i = 0; i < msg_count; i++) {
++#ifdef CAN_ERRATA_10_WORKAROUND
++    if (can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET)) {
++        //Peripheral was reset due to errata. Add lost messages to overrun count
++        p_can_obj->rx_overrun_count += can_context.rx_msg_cnt_reg;
++        can_alert_handler(CAN_ALERT_RX_FIFO_OVERRUN, alert_req);
++    }
++#endif
++    while (can_hal_get_rx_msg_count(&can_context) > 0) {
++        //Clear all messages (including valid or overrun)
+         can_hal_frame_t frame;
+-        can_hal_read_rx_buffer_and_clear(&can_context, &frame);
+-        //Copy frame into RX Queue
+-        if (xQueueSendFromISR(p_can_obj->rx_queue, &frame, task_woken) == pdTRUE) {
+-            p_can_obj->rx_msg_count++;
+-        } else {
+-            p_can_obj->rx_missed_count++;
+-            can_alert_handler(CAN_ALERT_RX_QUEUE_FULL, alert_req);
++        if (can_hal_read_rx_buffer_and_clear(&can_context, &frame)) {
++            //A valid frame was copied from the RX buffer
++            if (xQueueSendFromISR(p_can_obj->rx_queue, &frame, task_woken) == pdTRUE) {
++                p_can_obj->rx_msg_count++;
++            } else {
++                p_can_obj->rx_missed_count++;
++                can_alert_handler(CAN_ALERT_RX_QUEUE_FULL, alert_req);
++            }
++        } else{
++            //RX buffer points to an overrun frame.
++            p_can_obj->rx_overrun_count += can_hal_clear_rx_fifo_overrun(&can_context);
++#ifdef CAN_ERRATA_11_WORKAROUND
++            can_hal_errata_11_workaround(&can_context);
++#endif
++            can_alert_handler(CAN_ALERT_RX_FIFO_OVERRUN, alert_req);
+         }
+     }
+-    //Todo: Add Software Filters
+-    //Todo: Check for data overrun of RX FIFO, then trigger alert
+ }
+ 
+ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert_req)
+@@ -219,11 +182,14 @@ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert
+         p_can_obj->tx_failed_count++;
+         can_alert_handler(CAN_ALERT_TX_FAILED, alert_req);
+     }
+-
+     //Update TX message count
+     p_can_obj->tx_msg_count--;
+     assert(p_can_obj->tx_msg_count >= 0);     //Sanity check
+ 
++    if (can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_BUS_OFF)) {
++        //Can't transmit in bus off, return immediately
++        return;
++    }
+     //Check if there are more frames to transmit
+     if (p_can_obj->tx_msg_count > 0 && p_can_obj->tx_queue != NULL) {
+         can_hal_frame_t frame;
+@@ -235,7 +201,6 @@ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert
+         }
+     } else {
+         //No more frames to transmit
+-        CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+         can_alert_handler(CAN_ALERT_TX_IDLE, alert_req);
+     }
+ }
+@@ -244,49 +209,65 @@ static void can_intr_handler_main(void *arg)
+ {
+     BaseType_t task_woken = pdFALSE;
+     int alert_req = 0;
+-    uint32_t event;
++    uint32_t events;
++
+     CAN_ENTER_CRITICAL_ISR();
+-    if (p_can_obj == NULL) {    //Incase intr occurs whilst driver is being uninstalled
+-        CAN_EXIT_CRITICAL_ISR();
+-        return;
++    events = can_hal_isr_entry(&can_context);
++
++    //Handle errata workarounds that require hardware resets first
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++    if (events & CAN_HAL_EVENT_ERRATA_NEED_RESET) {
++        can_hal_prepare_for_hw_reset(&can_context, events);
++        periph_module_reset(PERIPH_CAN_MODULE);
++        can_hal_recover_from_hw_reset(&can_context);
++        can_alert_handler(CAN_ALERT_PERIPH_RESET, &alert_req);
+     }
+-    event = can_hal_decode_interrupt_events(&can_context, p_can_obj->control_flags & CTRL_FLAG_RECOVERING);
++#endif
+ 
+-    if (event & CAN_HAL_EVENT_BUS_OFF) {
++    //Handle error related events
++    if (events & CAN_HAL_EVENT_BUS_OFF) {
+         can_handle_bus_off(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_RECOV_CPLT) {
++    if (events & CAN_HAL_EVENT_BUS_RECOV_CPLT) {
+         can_handle_recovery_complete(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_RECOV_PROGRESS) {
+-        can_handle_recovery_in_progress(&alert_req);
++    if (events & CAN_HAL_EVENT_BUS_ERR) {
++        can_handle_bus_error(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ABOVE_EWL) {
+-        can_handle_above_ewl(&alert_req);
++    if (events & CAN_HAL_EVENT_ARB_LOST) {
++        can_handle_arb_lost(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BELOW_EWL) {
+-        can_handle_below_ewl(&alert_req);
++
++    //Handle RX then TX (TX should be called after RX as not to overwrite command registers)
++    if (events & CAN_HAL_EVENT_RX_BUFF_FRAME) {
++        can_handle_rx_buffer_frames(&task_woken, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ERROR_PASSIVE) {
+-        can_handle_error_passive(&alert_req);
++#ifdef CAN_ERRATA_11_WORKAROUND
++    if ((events & CAN_HAL_EVENT_TX_BUFF_FREE) || can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_INTR_MISS)) {
++#else
++    if (event & CAN_HAL_EVENT_TX_BUFF_FREE) {}
++#endif
++        can_handle_tx_buffer_frame(&task_woken, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ERROR_ACTIVE) {
+-        can_handle_error_active(&alert_req);
++
++    //Handle events that only require alerting (i.e. not handler)
++    if (events & CAN_HAL_EVENT_BUS_RECOV_PROGRESS) {
++        can_alert_handler(CAN_ALERT_RECOVERY_IN_PROGRESS, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_ERR) {
+-        can_handle_bus_error(&alert_req);
++    if (events & CAN_HAL_EVENT_ABOVE_EWL) {
++        can_alert_handler(CAN_ALERT_ABOVE_ERR_WARN, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ARB_LOST) {
+-        can_handle_arb_lost(&alert_req);
++    if (events & CAN_HAL_EVENT_BELOW_EWL) {
++        can_alert_handler(CAN_ALERT_BELOW_ERR_WARN, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_RX_BUFF_FRAME) {
+-        can_handle_rx_buffer_frames(&task_woken, &alert_req);
++    if (events & CAN_HAL_EVENT_ERROR_PASSIVE) {
++        can_alert_handler(CAN_ALERT_ERR_PASS, &alert_req);
+     }
+-    //TX command related handlers should be called last, so that other commands
+-    //do not overwrite the TX command related bits in the command register.
+-    if (event & CAN_HAL_EVENT_TX_BUFF_FREE) {
+-        can_handle_tx_buffer_frame(&task_woken, &alert_req);
++    if (events & CAN_HAL_EVENT_ERROR_ACTIVE) {
++        can_alert_handler(CAN_ALERT_ERR_ACTIVE, &alert_req);
+     }
++
++    can_hal_isr_exit(&can_context);
+     CAN_EXIT_CRITICAL_ISR();
+ 
+     if (p_can_obj->alert_semphr != NULL && alert_req) {
+@@ -366,8 +347,8 @@ esp_err_t can_driver_install(const can_general_config_t *g_config, const can_tim
+ #endif
+ 
+     //Initialize flags and variables. All other members are 0 initialized by calloc()
+-    p_can_obj_dummy->control_flags = CTRL_FLAG_STOPPED;
+     p_can_obj_dummy->mode = g_config->mode;
++    p_can_obj_dummy->driver_state = CAN_STATE_STOPPED;
+     p_can_obj_dummy->alerts_enabled = g_config->alerts_enabled;
+ 
+     //Initialize CAN peripheral registers, and allocate interrupt
+@@ -428,8 +409,9 @@ esp_err_t can_driver_uninstall(void)
+     CAN_ENTER_CRITICAL();
+     //Check state
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF), ESP_ERR_INVALID_STATE);
+-    //Todo: Add check to see if in reset mode.  //Enter reset mode to stop any CAN bus activity
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_STOPPED ||
++                        p_can_obj->driver_state == CAN_STATE_BUS_OFF,
++                        ESP_ERR_INVALID_STATE);
+     //Clear registers by reading
+     can_hal_deinit(&can_context);
+     periph_module_disable(PERIPH_CAN_MODULE);               //Disable CAN peripheral
+@@ -460,17 +442,16 @@ esp_err_t can_start(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_STOPPED, ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_STOPPED, ESP_ERR_INVALID_STATE);
+ 
+     //Reset RX queue, and RX message count
+     xQueueReset(p_can_obj->rx_queue);
+     p_can_obj->rx_msg_count = 0;
+-    //Todo: Add assert to see if in reset mode. //Should already be in bus-off mode, set again to make sure
+ 
+     //Currently in listen only mode, need to set to mode specified by configuration
+     assert(can_hal_start(&can_context, p_can_obj->mode));
++    p_can_obj->driver_state = CAN_STATE_RUNNING;
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+     CAN_EXIT_CRITICAL();
+     return ESP_OK;
+ }
+@@ -480,18 +461,16 @@ esp_err_t can_stop(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_RUNNING, ESP_ERR_INVALID_STATE);
+ 
+     assert(can_hal_stop(&can_context));
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+-
+     //Reset TX Queue and message count
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+ 
+     CAN_EXIT_CRITICAL();
+ 
+@@ -508,18 +487,17 @@ esp_err_t can_transmit(const can_message_t *message, TickType_t ticks_to_wait)
+     CAN_ENTER_CRITICAL();
+     //Check State
+     CAN_CHECK_FROM_CRIT(!(p_can_obj->mode == CAN_MODE_LISTEN_ONLY), ESP_ERR_NOT_SUPPORTED);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_RUNNING, ESP_ERR_INVALID_STATE);
+     //Format frame
+     esp_err_t ret = ESP_FAIL;
+     can_hal_frame_t tx_frame;
+     can_hal_format_frame(message, &tx_frame);
+ 
+     //Check if frame can be sent immediately
+-    if ((p_can_obj->tx_msg_count == 0) && !(p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED)) {
++    if (p_can_obj->tx_msg_count == 0) {
+         //No other frames waiting to transmit. Bypass queue and transmit immediately
+         can_hal_set_tx_buffer_and_transmit(&can_context, &tx_frame);
+         p_can_obj->tx_msg_count++;
+-        CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+         ret = ESP_OK;
+     }
+     CAN_EXIT_CRITICAL();
+@@ -531,24 +509,17 @@ esp_err_t can_transmit(const can_message_t *message, TickType_t ticks_to_wait)
+         } else if (xQueueSend(p_can_obj->tx_queue, &tx_frame, ticks_to_wait) == pdTRUE) {
+             //Copied to TX Queue
+             CAN_ENTER_CRITICAL();
+-            if (p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)) {
+-                //TX queue was reset (due to stop/bus_off), remove copied frame from queue to prevent transmission
+-                int res = xQueueReceive(p_can_obj->tx_queue, &tx_frame, 0);
+-                assert(res == pdTRUE);
+-                ret = ESP_ERR_INVALID_STATE;
+-            } else if ((p_can_obj->tx_msg_count == 0) && !(p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED)) {
+-                //TX buffer was freed during copy, manually trigger transmission
++            if (uxQueueMessagesWaiting(p_can_obj->tx_queue) > 0 && (!can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED))) {
++                //TX buffer was freed whilst current message was copied to queue, manually trigger transmission
+                 int res = xQueueReceive(p_can_obj->tx_queue, &tx_frame, 0);
+                 assert(res == pdTRUE);
+                 can_hal_set_tx_buffer_and_transmit(&can_context, &tx_frame);
+-                p_can_obj->tx_msg_count++;
+-                CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+                 ret = ESP_OK;
+             } else {
+                 //Frame was copied to queue, waiting to be transmitted
+-                p_can_obj->tx_msg_count++;
+                 ret = ESP_OK;
+             }
++            p_can_obj->tx_msg_count++;
+             CAN_EXIT_CRITICAL();
+         } else {
+             //Timed out waiting for free space on TX queue
+@@ -619,19 +590,17 @@ esp_err_t can_initiate_recovery(void)
+     CAN_ENTER_CRITICAL();
+     //Check state
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_BUS_OFF, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & CTRL_FLAG_RECOVERING), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_BUS_OFF, ESP_ERR_INVALID_STATE);
+ 
+     //Reset TX Queue/Counters
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING);
+ 
+     //Trigger start of recovery process
+     assert(can_hal_start_bus_recovery(&can_context));
++    p_can_obj->driver_state = CAN_STATE_RECOVERING;
+     CAN_EXIT_CRITICAL();
+ 
+     return ESP_OK;
+@@ -650,17 +619,10 @@ esp_err_t can_get_status_info(can_status_info_t *status_info)
+     status_info->msgs_to_rx = p_can_obj->rx_msg_count;
+     status_info->tx_failed_count = p_can_obj->tx_failed_count;
+     status_info->rx_missed_count = p_can_obj->rx_missed_count;
++    status_info->rx_overrun_count = p_can_obj->rx_overrun_count;
+     status_info->arb_lost_count = p_can_obj->arb_lost_count;
+     status_info->bus_error_count = p_can_obj->bus_error_count;
+-    if (p_can_obj->control_flags & CTRL_FLAG_RECOVERING) {
+-        status_info->state = CAN_STATE_RECOVERING;
+-    } else if (p_can_obj->control_flags & CTRL_FLAG_BUS_OFF) {
+-        status_info->state = CAN_STATE_BUS_OFF;
+-    } else if (p_can_obj->control_flags & CTRL_FLAG_STOPPED) {
+-        status_info->state = CAN_STATE_STOPPED;
+-    } else {
+-        status_info->state = CAN_STATE_RUNNING;
+-    }
++    status_info->state = p_can_obj->driver_state;
+     CAN_EXIT_CRITICAL();
+ 
+     return ESP_OK;
+@@ -674,7 +636,7 @@ esp_err_t can_clear_transmit_queue(void)
+ 
+     CAN_ENTER_CRITICAL();
+     //If a message is currently undergoing transmission, the tx interrupt handler will decrement tx_msg_count
+-    p_can_obj->tx_msg_count = (p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED) ? 1 : 0;
++    p_can_obj->tx_msg_count = can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED) ? 1 : 0;
+     xQueueReset(p_can_obj->tx_queue);
+     CAN_EXIT_CRITICAL();
+ 

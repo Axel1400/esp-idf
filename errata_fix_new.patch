@@ -1,0 +1,1342 @@
+From 04bf8da4d4a37dfa5a245033806958d0fde2e865 Mon Sep 17 00:00:00 2001
+From: Darian Leung <darian@espressif.com>
+Date: Thu, 21 May 2020 01:43:43 +0800
+Subject: [PATCH] CAN: Add FIFO overrun errata workaround, Bus Off bugfix
+
+This commit adds workarounds for RX FIFO overrun errata.
+State tracking of the peripheral has been moved to the
+HAL layer for cleaner abstraction.
+
+A bugfix for stuck Bus Off recovery is also added
+
+Closes https://github.com/espressif/esp-idf/issues/2519
+---
+ components/driver/can.c                       | 228 ++++++++----------
+ components/driver/include/driver/can.h        |   7 +-
+ components/soc/esp32/include/hal/can_ll.h     | 187 ++++++++++++--
+ components/soc/esp32/include/soc/can_caps.h   |  43 +++-
+ components/soc/esp32/include/soc/can_struct.h |   4 +-
+ components/soc/include/hal/can_hal.h          | 212 +++++++++++++---
+ components/soc/src/hal/can_hal.c              | 155 ++++++++++--
+ 7 files changed, 620 insertions(+), 216 deletions(-)
+
+diff --git a/components/driver/can.c b/components/driver/can.c
+index 4ff728b800..ecae9dcf83 100644
+--- a/components/driver/can.c
++++ b/components/driver/can.c
+@@ -44,20 +44,9 @@
+                 return ret_val;                                             \
+             }                                                               \
+ })
+-#define CAN_SET_FLAG(var, mask)     ((var) |= (mask))
+-#define CAN_RESET_FLAG(var, mask)   ((var) &= ~(mask))
+-#define CAN_TAG "CAN"
+ 
++#define CAN_TAG "CAN"
+ #define DRIVER_DEFAULT_INTERRUPTS   0xE7        //Exclude data overrun (bit[3]) and brp_div (bit[4])
+-
+-//Control flags
+-#define CTRL_FLAG_STOPPED           0x001       //CAN peripheral in stopped state
+-#define CTRL_FLAG_RECOVERING        0x002       //Bus is undergoing bus recovery
+-#define CTRL_FLAG_ERR_WARN          0x004       //TEC or REC is >= error warning limit
+-#define CTRL_FLAG_ERR_PASSIVE       0x008       //TEC or REC is >= 128
+-#define CTRL_FLAG_BUS_OFF           0x010       //Bus-off due to TEC >= 256
+-#define CTRL_FLAG_TX_BUFF_OCCUPIED  0x020       //Transmit buffer is occupied
+-
+ #define ALERT_LOG_LEVEL_WARNING     CAN_ALERT_ARB_LOST  //Alerts above and including this level use ESP_LOGW
+ #define ALERT_LOG_LEVEL_ERROR       CAN_ALERT_TX_FAILED //Alerts above and including this level use ESP_LOGE
+ 
+@@ -66,9 +55,10 @@
+ //Control structure for CAN driver
+ typedef struct {
+     //Control and status members
+-    uint32_t control_flags;
+     can_mode_t mode;
++    can_state_t driver_state;
+     uint32_t rx_missed_count;
++    uint32_t rx_overrun_count;
+     uint32_t tx_failed_count;
+     uint32_t arb_lost_count;
+     uint32_t bus_error_count;
+@@ -103,7 +93,7 @@ static void can_alert_handler(uint32_t alert_code, int *alert_req)
+ {
+     if (p_can_obj->alerts_enabled & alert_code) {
+         //Signify alert has occurred
+-        CAN_SET_FLAG(p_can_obj->alerts_triggered, alert_code);
++        p_can_obj->alerts_triggered |= alert_code;
+         *alert_req = 1;
+         if (p_can_obj->alerts_enabled & CAN_ALERT_AND_LOG) {
+             if (alert_code >= ALERT_LOG_LEVEL_ERROR) {
+@@ -120,11 +110,11 @@ static void can_alert_handler(uint32_t alert_code, int *alert_req)
+ static inline void can_handle_bus_off(int *alert_req)
+ {
+     //Bus-Off condition. TEC should set and held at 127, REC should be 0, reset mode entered
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_BUS_OFF);
+     /* Note: REC is still allowed to increase during bus-off. REC > err_warn
+        can prevent "bus recovery complete" interrupt from occurring. Set to
+        listen only mode to freeze REC. */
+     can_hal_handle_bus_off(&can_context);
++    p_can_obj->driver_state = CAN_STATE_BUS_OFF;
+     can_alert_handler(CAN_ALERT_BUS_OFF, alert_req);
+ }
+ 
+@@ -132,49 +122,10 @@ static inline void can_handle_recovery_complete(int *alert_req)
+ {
+     //Bus recovery complete.
+     assert(can_hal_handle_bus_recov_cplt(&can_context));
+-
+-    //Reset and set flags to the equivalent of the stopped state
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING | CTRL_FLAG_ERR_WARN |
+-                                             CTRL_FLAG_ERR_PASSIVE | CTRL_FLAG_BUS_OFF |
+-                                             CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+     can_alert_handler(CAN_ALERT_BUS_RECOVERED, alert_req);
+ }
+ 
+-static inline void can_handle_recovery_in_progress(int * alert_req)
+-{
+-    //Bus-recovery in progress. TEC has dropped below error warning limit
+-    can_alert_handler(CAN_ALERT_RECOVERY_IN_PROGRESS, alert_req);
+-}
+-
+-static inline void can_handle_above_ewl(int *alert_req)
+-{
+-    //TEC or REC surpassed error warning limit
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_ABOVE_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_below_ewl(int *alert_req)
+-{
+-    //TEC and REC are both below error warning
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_WARN);
+-    can_alert_handler(CAN_ALERT_BELOW_ERR_WARN, alert_req);
+-}
+-
+-static inline void can_handle_error_passive(int *alert_req)
+-{
+-    //Entered error passive
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_PASS, alert_req);
+-}
+-
+-static inline void can_handle_error_active(int *alert_req)
+-{
+-    //Returned to error active
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_ERR_PASSIVE);
+-    can_alert_handler(CAN_ALERT_ERR_ACTIVE, alert_req);
+-}
+-
+ static inline void can_handle_bus_error(int *alert_req)
+ {
+     // ECC register is read to re-arm bus error interrupt. ECC is not used
+@@ -193,21 +144,33 @@ static inline void can_handle_arb_lost(int *alert_req)
+ 
+ static inline void can_handle_rx_buffer_frames(BaseType_t *task_woken, int *alert_req)
+ {
+-    uint32_t msg_count = can_hal_get_rx_msg_count(&can_context);
+-
+-    for (int i = 0; i < msg_count; i++) {
++#ifdef CAN_ERRATA_10_WORKAROUND
++    if (can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET)) {
++        //Peripheral was reset due to errata. Add lost messages to overrun count
++        p_can_obj->rx_overrun_count += can_context.rx_msg_cnt_reg;
++        can_alert_handler(CAN_ALERT_RX_FIFO_OVERRUN, alert_req);
++    }
++#endif
++    while (can_hal_get_rx_msg_count(&can_context) > 0) {
++        //Clear all messages (including valid or overrun)
+         can_hal_frame_t frame;
+-        can_hal_read_rx_buffer_and_clear(&can_context, &frame);
+-        //Copy frame into RX Queue
+-        if (xQueueSendFromISR(p_can_obj->rx_queue, &frame, task_woken) == pdTRUE) {
+-            p_can_obj->rx_msg_count++;
+-        } else {
+-            p_can_obj->rx_missed_count++;
+-            can_alert_handler(CAN_ALERT_RX_QUEUE_FULL, alert_req);
++        if (can_hal_read_rx_buffer_and_clear(&can_context, &frame)) {
++            //A valid frame was copied from the RX buffer
++            if (xQueueSendFromISR(p_can_obj->rx_queue, &frame, task_woken) == pdTRUE) {
++                p_can_obj->rx_msg_count++;
++            } else {
++                p_can_obj->rx_missed_count++;
++                can_alert_handler(CAN_ALERT_RX_QUEUE_FULL, alert_req);
++            }
++        } else{
++            //RX buffer points to an overrun frame.
++            p_can_obj->rx_overrun_count += can_hal_clear_rx_fifo_overrun(&can_context);
++#ifdef CAN_ERRATA_11_WORKAROUND
++            can_hal_errata_11_workaround(&can_context);
++#endif
++            can_alert_handler(CAN_ALERT_RX_FIFO_OVERRUN, alert_req);
+         }
+     }
+-    //Todo: Add Software Filters
+-    //Todo: Check for data overrun of RX FIFO, then trigger alert
+ }
+ 
+ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert_req)
+@@ -219,11 +182,14 @@ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert
+         p_can_obj->tx_failed_count++;
+         can_alert_handler(CAN_ALERT_TX_FAILED, alert_req);
+     }
+-
+     //Update TX message count
+     p_can_obj->tx_msg_count--;
+     assert(p_can_obj->tx_msg_count >= 0);     //Sanity check
+ 
++    if (can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_BUS_OFF)) {
++        //Can't transmit in bus off, return immediately
++        return;
++    }
+     //Check if there are more frames to transmit
+     if (p_can_obj->tx_msg_count > 0 && p_can_obj->tx_queue != NULL) {
+         can_hal_frame_t frame;
+@@ -235,7 +201,6 @@ static inline void can_handle_tx_buffer_frame(BaseType_t *task_woken, int *alert
+         }
+     } else {
+         //No more frames to transmit
+-        CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+         can_alert_handler(CAN_ALERT_TX_IDLE, alert_req);
+     }
+ }
+@@ -244,49 +209,65 @@ static void can_intr_handler_main(void *arg)
+ {
+     BaseType_t task_woken = pdFALSE;
+     int alert_req = 0;
+-    uint32_t event;
++    uint32_t events;
++
+     CAN_ENTER_CRITICAL_ISR();
+-    if (p_can_obj == NULL) {    //Incase intr occurs whilst driver is being uninstalled
+-        CAN_EXIT_CRITICAL_ISR();
+-        return;
++    events = can_hal_isr_entry(&can_context);
++
++    //Handle errata workarounds that require hardware resets first
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++    if (events & CAN_HAL_EVENT_ERRATA_NEED_RESET) {
++        can_hal_prepare_for_hw_reset(&can_context, events);
++        periph_module_reset(PERIPH_CAN_MODULE);
++        can_hal_recover_from_hw_reset(&can_context);
++        can_alert_handler(CAN_ALERT_PERIPH_RESET, &alert_req);
+     }
+-    event = can_hal_decode_interrupt_events(&can_context, p_can_obj->control_flags & CTRL_FLAG_RECOVERING);
++#endif
+ 
+-    if (event & CAN_HAL_EVENT_BUS_OFF) {
++    //Handle error related events
++    if (events & CAN_HAL_EVENT_BUS_OFF) {
+         can_handle_bus_off(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_RECOV_CPLT) {
++    if (events & CAN_HAL_EVENT_BUS_RECOV_CPLT) {
+         can_handle_recovery_complete(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_RECOV_PROGRESS) {
+-        can_handle_recovery_in_progress(&alert_req);
++    if (events & CAN_HAL_EVENT_BUS_ERR) {
++        can_handle_bus_error(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ABOVE_EWL) {
+-        can_handle_above_ewl(&alert_req);
++    if (events & CAN_HAL_EVENT_ARB_LOST) {
++        can_handle_arb_lost(&alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BELOW_EWL) {
+-        can_handle_below_ewl(&alert_req);
++
++    //Handle RX then TX (TX should be called after RX as not to overwrite command registers)
++    if (events & CAN_HAL_EVENT_RX_BUFF_FRAME) {
++        can_handle_rx_buffer_frames(&task_woken, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ERROR_PASSIVE) {
+-        can_handle_error_passive(&alert_req);
++#ifdef CAN_ERRATA_11_WORKAROUND
++    if ((events & CAN_HAL_EVENT_TX_BUFF_FREE) || can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_INTR_MISS)) {
++#else
++    if (event & CAN_HAL_EVENT_TX_BUFF_FREE) {}
++#endif
++        can_handle_tx_buffer_frame(&task_woken, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ERROR_ACTIVE) {
+-        can_handle_error_active(&alert_req);
++
++    //Handle events that only require alerting (i.e. not handler)
++    if (events & CAN_HAL_EVENT_BUS_RECOV_PROGRESS) {
++        can_alert_handler(CAN_ALERT_RECOVERY_IN_PROGRESS, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_BUS_ERR) {
+-        can_handle_bus_error(&alert_req);
++    if (events & CAN_HAL_EVENT_ABOVE_EWL) {
++        can_alert_handler(CAN_ALERT_ABOVE_ERR_WARN, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_ARB_LOST) {
+-        can_handle_arb_lost(&alert_req);
++    if (events & CAN_HAL_EVENT_BELOW_EWL) {
++        can_alert_handler(CAN_ALERT_BELOW_ERR_WARN, &alert_req);
+     }
+-    if (event & CAN_HAL_EVENT_RX_BUFF_FRAME) {
+-        can_handle_rx_buffer_frames(&task_woken, &alert_req);
++    if (events & CAN_HAL_EVENT_ERROR_PASSIVE) {
++        can_alert_handler(CAN_ALERT_ERR_PASS, &alert_req);
+     }
+-    //TX command related handlers should be called last, so that other commands
+-    //do not overwrite the TX command related bits in the command register.
+-    if (event & CAN_HAL_EVENT_TX_BUFF_FREE) {
+-        can_handle_tx_buffer_frame(&task_woken, &alert_req);
++    if (events & CAN_HAL_EVENT_ERROR_ACTIVE) {
++        can_alert_handler(CAN_ALERT_ERR_ACTIVE, &alert_req);
+     }
++
++    can_hal_isr_exit(&can_context);
+     CAN_EXIT_CRITICAL_ISR();
+ 
+     if (p_can_obj->alert_semphr != NULL && alert_req) {
+@@ -366,8 +347,8 @@ esp_err_t can_driver_install(const can_general_config_t *g_config, const can_tim
+ #endif
+ 
+     //Initialize flags and variables. All other members are 0 initialized by calloc()
+-    p_can_obj_dummy->control_flags = CTRL_FLAG_STOPPED;
+     p_can_obj_dummy->mode = g_config->mode;
++    p_can_obj_dummy->driver_state = CAN_STATE_STOPPED;
+     p_can_obj_dummy->alerts_enabled = g_config->alerts_enabled;
+ 
+     //Initialize CAN peripheral registers, and allocate interrupt
+@@ -428,8 +409,9 @@ esp_err_t can_driver_uninstall(void)
+     CAN_ENTER_CRITICAL();
+     //Check state
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF), ESP_ERR_INVALID_STATE);
+-    //Todo: Add check to see if in reset mode.  //Enter reset mode to stop any CAN bus activity
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_STOPPED ||
++                        p_can_obj->driver_state == CAN_STATE_BUS_OFF,
++                        ESP_ERR_INVALID_STATE);
+     //Clear registers by reading
+     can_hal_deinit(&can_context);
+     periph_module_disable(PERIPH_CAN_MODULE);               //Disable CAN peripheral
+@@ -460,17 +442,16 @@ esp_err_t can_start(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_STOPPED, ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_STOPPED, ESP_ERR_INVALID_STATE);
+ 
+     //Reset RX queue, and RX message count
+     xQueueReset(p_can_obj->rx_queue);
+     p_can_obj->rx_msg_count = 0;
+-    //Todo: Add assert to see if in reset mode. //Should already be in bus-off mode, set again to make sure
+ 
+     //Currently in listen only mode, need to set to mode specified by configuration
+     assert(can_hal_start(&can_context, p_can_obj->mode));
++    p_can_obj->driver_state = CAN_STATE_RUNNING;
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+     CAN_EXIT_CRITICAL();
+     return ESP_OK;
+ }
+@@ -480,18 +461,16 @@ esp_err_t can_stop(void)
+     //Check state
+     CAN_ENTER_CRITICAL();
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_RUNNING, ESP_ERR_INVALID_STATE);
+ 
+     assert(can_hal_stop(&can_context));
+ 
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_STOPPED);
+-
+     //Reset TX Queue and message count
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
++    p_can_obj->driver_state = CAN_STATE_STOPPED;
+ 
+     CAN_EXIT_CRITICAL();
+ 
+@@ -508,18 +487,17 @@ esp_err_t can_transmit(const can_message_t *message, TickType_t ticks_to_wait)
+     CAN_ENTER_CRITICAL();
+     //Check State
+     CAN_CHECK_FROM_CRIT(!(p_can_obj->mode == CAN_MODE_LISTEN_ONLY), ESP_ERR_NOT_SUPPORTED);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_RUNNING, ESP_ERR_INVALID_STATE);
+     //Format frame
+     esp_err_t ret = ESP_FAIL;
+     can_hal_frame_t tx_frame;
+     can_hal_format_frame(message, &tx_frame);
+ 
+     //Check if frame can be sent immediately
+-    if ((p_can_obj->tx_msg_count == 0) && !(p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED)) {
++    if (p_can_obj->tx_msg_count == 0) {
+         //No other frames waiting to transmit. Bypass queue and transmit immediately
+         can_hal_set_tx_buffer_and_transmit(&can_context, &tx_frame);
+         p_can_obj->tx_msg_count++;
+-        CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+         ret = ESP_OK;
+     }
+     CAN_EXIT_CRITICAL();
+@@ -531,24 +509,17 @@ esp_err_t can_transmit(const can_message_t *message, TickType_t ticks_to_wait)
+         } else if (xQueueSend(p_can_obj->tx_queue, &tx_frame, ticks_to_wait) == pdTRUE) {
+             //Copied to TX Queue
+             CAN_ENTER_CRITICAL();
+-            if (p_can_obj->control_flags & (CTRL_FLAG_STOPPED | CTRL_FLAG_BUS_OFF)) {
+-                //TX queue was reset (due to stop/bus_off), remove copied frame from queue to prevent transmission
+-                int res = xQueueReceive(p_can_obj->tx_queue, &tx_frame, 0);
+-                assert(res == pdTRUE);
+-                ret = ESP_ERR_INVALID_STATE;
+-            } else if ((p_can_obj->tx_msg_count == 0) && !(p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED)) {
+-                //TX buffer was freed during copy, manually trigger transmission
++            if (uxQueueMessagesWaiting(p_can_obj->tx_queue) > 0 && (!can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED))) {
++                //TX buffer was freed whilst current message was copied to queue, manually trigger transmission
+                 int res = xQueueReceive(p_can_obj->tx_queue, &tx_frame, 0);
+                 assert(res == pdTRUE);
+                 can_hal_set_tx_buffer_and_transmit(&can_context, &tx_frame);
+-                p_can_obj->tx_msg_count++;
+-                CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+                 ret = ESP_OK;
+             } else {
+                 //Frame was copied to queue, waiting to be transmitted
+-                p_can_obj->tx_msg_count++;
+                 ret = ESP_OK;
+             }
++            p_can_obj->tx_msg_count++;
+             CAN_EXIT_CRITICAL();
+         } else {
+             //Timed out waiting for free space on TX queue
+@@ -619,19 +590,17 @@ esp_err_t can_initiate_recovery(void)
+     CAN_ENTER_CRITICAL();
+     //Check state
+     CAN_CHECK_FROM_CRIT(p_can_obj != NULL, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(p_can_obj->control_flags & CTRL_FLAG_BUS_OFF, ESP_ERR_INVALID_STATE);
+-    CAN_CHECK_FROM_CRIT(!(p_can_obj->control_flags & CTRL_FLAG_RECOVERING), ESP_ERR_INVALID_STATE);
++    CAN_CHECK_FROM_CRIT(p_can_obj->driver_state == CAN_STATE_BUS_OFF, ESP_ERR_INVALID_STATE);
+ 
+     //Reset TX Queue/Counters
+     if (p_can_obj->tx_queue != NULL) {
+         xQueueReset(p_can_obj->tx_queue);
+     }
+     p_can_obj->tx_msg_count = 0;
+-    CAN_RESET_FLAG(p_can_obj->control_flags, CTRL_FLAG_TX_BUFF_OCCUPIED);
+-    CAN_SET_FLAG(p_can_obj->control_flags, CTRL_FLAG_RECOVERING);
+ 
+     //Trigger start of recovery process
+     assert(can_hal_start_bus_recovery(&can_context));
++    p_can_obj->driver_state = CAN_STATE_RECOVERING;
+     CAN_EXIT_CRITICAL();
+ 
+     return ESP_OK;
+@@ -650,17 +619,10 @@ esp_err_t can_get_status_info(can_status_info_t *status_info)
+     status_info->msgs_to_rx = p_can_obj->rx_msg_count;
+     status_info->tx_failed_count = p_can_obj->tx_failed_count;
+     status_info->rx_missed_count = p_can_obj->rx_missed_count;
++    status_info->rx_overrun_count = p_can_obj->rx_overrun_count;
+     status_info->arb_lost_count = p_can_obj->arb_lost_count;
+     status_info->bus_error_count = p_can_obj->bus_error_count;
+-    if (p_can_obj->control_flags & CTRL_FLAG_RECOVERING) {
+-        status_info->state = CAN_STATE_RECOVERING;
+-    } else if (p_can_obj->control_flags & CTRL_FLAG_BUS_OFF) {
+-        status_info->state = CAN_STATE_BUS_OFF;
+-    } else if (p_can_obj->control_flags & CTRL_FLAG_STOPPED) {
+-        status_info->state = CAN_STATE_STOPPED;
+-    } else {
+-        status_info->state = CAN_STATE_RUNNING;
+-    }
++    status_info->state = p_can_obj->driver_state;
+     CAN_EXIT_CRITICAL();
+ 
+     return ESP_OK;
+@@ -674,7 +636,7 @@ esp_err_t can_clear_transmit_queue(void)
+ 
+     CAN_ENTER_CRITICAL();
+     //If a message is currently undergoing transmission, the tx interrupt handler will decrement tx_msg_count
+-    p_can_obj->tx_msg_count = (p_can_obj->control_flags & CTRL_FLAG_TX_BUFF_OCCUPIED) ? 1 : 0;
++    p_can_obj->tx_msg_count = can_hal_check_state_flags(&can_context, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED) ? 1 : 0;
+     xQueueReset(p_can_obj->tx_queue);
+     CAN_EXIT_CRITICAL();
+ 
+diff --git a/components/driver/include/driver/can.h b/components/driver/include/driver/can.h
+index 16b88f98ae..373d74ef88 100644
+--- a/components/driver/include/driver/can.h
++++ b/components/driver/include/driver/can.h
+@@ -68,9 +68,11 @@ extern "C" {
+ #define CAN_ALERT_RX_QUEUE_FULL         0x0400      /**< Alert(1024): The RX queue is full causing a frame to be lost */
+ #define CAN_ALERT_ERR_PASS              0x0800      /**< Alert(2048): CAN controller has become error passive */
+ #define CAN_ALERT_BUS_OFF               0x1000      /**< Alert(4096): Bus-off condition occurred. CAN controller can no longer influence bus */
+-#define CAN_ALERT_ALL                   0x1FFF      /**< Bit mask to enable all alerts during configuration */
++#define CAN_ALERT_RX_FIFO_OVERRUN       0x2000      /**< Alert(8192): An RX FIFO overrun has occurred */
++#define CAN_ALERT_PERIPH_RESET          0x4000      /**< Alert(16384): The CAN controller was reset */
++#define CAN_ALERT_ALL                   0x7FFF      /**< Bit mask to enable all alerts during configuration */
+ #define CAN_ALERT_NONE                  0x0000      /**< Bit mask to disable all alerts during configuration */
+-#define CAN_ALERT_AND_LOG               0x2000      /**< Bit mask to enable alerts to also be logged when they occur */
++#define CAN_ALERT_AND_LOG               0x8000      /**< Bit mask to enable alerts to also be logged when they occur */
+ 
+ /** @endcond */
+ 
+@@ -116,6 +118,7 @@ typedef struct {
+     uint32_t rx_error_counter;      /**< Current value of Receive Error Counter */
+     uint32_t tx_failed_count;       /**< Number of messages that failed transmissions */
+     uint32_t rx_missed_count;       /**< Number of messages that were lost due to a full RX queue */
++    uint32_t rx_overrun_count;       /**< Number of messages that were lost due to a RX FIFO overrun */
+     uint32_t arb_lost_count;        /**< Number of instances arbitration was lost */
+     uint32_t bus_error_count;       /**< Number of instances a bus error has occurred */
+ } can_status_info_t;
+diff --git a/components/soc/esp32/include/hal/can_ll.h b/components/soc/esp32/include/hal/can_ll.h
+index c498ed59a5..49d9658399 100644
+--- a/components/soc/esp32/include/hal/can_ll.h
++++ b/components/soc/esp32/include/hal/can_ll.h
+@@ -33,22 +33,22 @@ extern "C" {
+ 
+ /* ------------------------- Defines and Typedefs --------------------------- */
+ 
+-#define CAN_LL_STATUS_RBS       (0x1 << 0)
+-#define CAN_LL_STATUS_DOS       (0x1 << 1)
+-#define CAN_LL_STATUS_TBS       (0x1 << 2)
+-#define CAN_LL_STATUS_TCS       (0x1 << 3)
+-#define CAN_LL_STATUS_RS        (0x1 << 4)
+-#define CAN_LL_STATUS_TS        (0x1 << 5)
+-#define CAN_LL_STATUS_ES        (0x1 << 6)
+-#define CAN_LL_STATUS_BS        (0x1 << 7)
+-
+-#define CAN_LL_INTR_RI          (0x1 << 0)
+-#define CAN_LL_INTR_TI          (0x1 << 1)
+-#define CAN_LL_INTR_EI          (0x1 << 2)
++#define CAN_LL_STATUS_RBS       (0x1 << 0)  //Receive Buffer Status 
++#define CAN_LL_STATUS_DOS       (0x1 << 1)  //Data Overrun Status
++#define CAN_LL_STATUS_TBS       (0x1 << 2)  //Transmit Buffer Status
++#define CAN_LL_STATUS_TCS       (0x1 << 3)  //Transmission Complete Status
++#define CAN_LL_STATUS_RS        (0x1 << 4)  //Receive Status
++#define CAN_LL_STATUS_TS        (0x1 << 5)  //Transmit Status
++#define CAN_LL_STATUS_ES        (0x1 << 6)  //Error Status
++#define CAN_LL_STATUS_BS        (0x1 << 7)  //Bus Status
++
++#define CAN_LL_INTR_RI          (0x1 << 0)  //Receive Interrupt
++#define CAN_LL_INTR_TI          (0x1 << 1)  //Transmit Interrupt
++#define CAN_LL_INTR_EI          (0x1 << 2)  //Error Interrupt
+ //Data overrun interrupt not supported in SW due to HW peculiarities
+-#define CAN_LL_INTR_EPI         (0x1 << 5)
+-#define CAN_LL_INTR_ALI         (0x1 << 6)
+-#define CAN_LL_INTR_BEI         (0x1 << 7)
++#define CAN_LL_INTR_EPI         (0x1 << 5)  //Error Passive Interrupt
++#define CAN_LL_INTR_ALI         (0x1 << 6)  //Arbitration Lost Interrupt
++#define CAN_LL_INTR_BEI         (0x1 << 7)  //Bus Error Interrupt
+ 
+ /*
+  * The following frame structure has an NEARLY identical bit field layout to
+@@ -82,6 +82,68 @@ typedef union {
+     uint8_t bytes[13];
+ } __attribute__((packed)) can_ll_frame_buffer_t;
+ 
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++/**
++ * Some errata workarounds will require a hardware reset of the peripheral. Thus
++ * certain registers must be saved before the reset, and then restored after the
++ * reset. This structure is used to hold some of those registers. 
++ */
++typedef struct {
++    uint8_t mode_reg;
++    uint8_t interrupt_enable_reg;
++    uint8_t bus_timing_0_reg;
++    uint8_t bus_timing_1_reg;
++    uint8_t error_warning_limit_reg;
++    uint8_t acr_reg[4];
++    uint8_t amr_reg[4];
++    uint8_t rx_error_counter_reg;
++    uint8_t tx_error_counter_reg;
++    uint8_t clock_divider_reg;
++} __attribute__((packed)) can_ll_reg_save_t;
++#endif
++
++typedef enum {
++    CAN_LL_ERR_BIT = 0,
++    CAN_LL_ERR_FORM,
++    CAN_LL_ERR_STUFF,
++    CAN_LL_ERR_OTHER,
++    CAN_LL_ERR_MAX,
++} can_ll_err_type_t;
++
++typedef enum {
++    CAN_LL_ERR_DIR_TX = 0,
++    CAN_LL_ERR_DIR_RX,
++    CAN_LL_ERR_DIR_MAX,
++} can_ll_err_dir_t;
++
++typedef enum {
++    CAN_LL_ERR_SEG_SOF = 0,
++    CAN_LL_ERR_SEG_ID_28_21 = 2,
++    CAN_LL_ERR_SEG_SRTR = 4,
++    CAN_LL_ERR_SEG_IDE = 5,
++    CAN_LL_ERR_SEG_ID_20_18 = 6,
++    CAN_LL_ERR_SEG_ID_17_13 = 7,
++    CAN_LL_ERR_SEG_CRC_SEQ = 8,
++    CAN_LL_ERR_SEG_R0 = 9,
++    CAN_LL_ERR_SEG_DATA = 10,
++    CAN_LL_ERR_SEG_DLC = 11,
++    CAN_LL_ERR_SEG_RTR = 12,
++    CAN_LL_ERR_SEG_R1 = 13,
++    CAN_LL_ERR_SEG_ID_4_0 = 14,
++    CAN_LL_ERR_SEG_ID_12_5 = 15,
++    CAN_LL_ERR_SEG_ACT_FLAG = 17,
++    CAN_LL_ERR_SEG_INTER = 18,
++    CAN_LL_ERR_SEG_SUPERPOS = 19,
++    CAN_LL_ERR_SEG_PASS_FLAG = 22,
++    CAN_LL_ERR_SEG_ERR_DELIM = 23,
++    CAN_LL_ERR_SEG_CRC_DELIM = 24,
++    CAN_LL_ERR_SEG_ACK_SLOT = 25,
++    CAN_LL_ERR_SEG_EOF = 26,
++    CAN_LL_ERR_SEG_ACK_DELIM = 27,
++    CAN_LL_ERR_SEG_OVRLD_FLAG = 28,
++    CAN_LL_ERR_SEG_MAX = 29,
++} can_ll_err_seg_t;
++
+ /* ---------------------------- Mode Register ------------------------------- */
+ 
+ /**
+@@ -377,31 +439,52 @@ static inline void can_ll_set_bus_timing(can_dev_t *hw, uint32_t brp, uint32_t s
+ /* ----------------------------- ALC Register ------------------------------- */
+ 
+ /**
+- * @brief   Clear Arbitration Lost Capture Register
++ * @brief   Read the Arbitration Lost Capture Register
+  *
+- * Reading the ALC register rearms the Arbitration Lost Interrupt
++ * Reading the ALC register automatically clears it and also rearms the
++ * Arbitration Lost Interrupt
+  *
+  * @param hw Start address of the CAN registers
++ * @return ALC register
+  */
+-static inline void can_ll_clear_arb_lost_cap(can_dev_t *hw)
++static inline uint32_t can_ll_get_arb_lost_cap(can_dev_t *hw)
+ {
+-    (void)hw->arbitration_lost_captue_reg.val;
+-    //Todo: Decode ALC register
++    return hw->arbitration_lost_captue_reg.val;
+ }
+ 
+ /* ----------------------------- ECC Register ------------------------------- */
+ 
+ /**
+- * @brief   Clear Error Code Capture register
++ * @brief   Read the Error Code Capture register
+  *
+- * Reading the ECC register rearms the Bus Error Interrupt
++ * Reading the ECC register automatically clears it and also rearms the Bus 
++ * Error Interrupt.
+  *
+  * @param hw Start address of the CAN registers
++ * @return ECC register
++ */
++static inline uint32_t can_ll_get_err_code_cap(can_dev_t *hw)
++{
++    return hw->error_code_capture_reg.val;
++}
++
++/**
++ * @brief   Decode the Error Code Capture register
++ *
++ * Decodes the contents of the Error Code Capture register to determine details
++ * regarding the captured bus error.
++ *
++ * @param ecc[in] Value of ECC register
++ * @param type[out] Type of bus error
++ * @param dir[out] Direction when error occurred
++ * @param seg[out] Segment where error occurred
+  */
+-static inline void can_ll_clear_err_code_cap(can_dev_t *hw)
++static inline void can_ll_decode_err_code_cap(uint32_t ecc, can_ll_err_type_t *type, can_ll_err_dir_t *dir, can_ll_err_seg_t *seg)
+ {
+-    (void)hw->error_code_capture_reg.val;
+-    //Todo: Decode error code capture
++    //Decode ECC register fields
++    *type = (can_ll_err_type_t) ((ecc >> 6) & 0x3);
++    *dir = (can_ll_err_dir_t) ((ecc >> 5) & 0x1);
++    *seg = (can_ll_err_seg_t) (ecc & 0x1F);
+ }
+ 
+ /* ----------------------------- EWL Register ------------------------------- */
+@@ -698,6 +781,60 @@ static inline void can_ll_enable_extended_reg_layout(can_dev_t *hw)
+     hw->clock_divider_reg.cm = 1;
+ }
+ 
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++/**
++ * @brief   Saves the current values of the controller's registers
++ * 
++ * This function saves the current values of the controller's registers in
++ * preparation for a hardware reset of the peripheral.
++ * 
++ * @param hw Start address of the CAN registers
++ * @param reg_save Pointer to structure to store register values
++ * @note Must be called in reset mode so that config registers become accessible.
++ * @note Some registers are cleared on entering reset mode so must be saved
++ *       separate from this function.
++ */
++static inline void can_ll_save_reg(can_dev_t *hw, can_ll_reg_save_t *reg_save)
++{
++    reg_save->mode_reg = (uint8_t) hw->mode_reg.val;
++    reg_save->interrupt_enable_reg = (uint8_t) hw->interrupt_enable_reg.val;
++    reg_save->bus_timing_0_reg = (uint8_t) hw->bus_timing_0_reg.val;
++    reg_save->bus_timing_1_reg = (uint8_t) hw->bus_timing_1_reg.val;
++    reg_save->error_warning_limit_reg = (uint8_t) hw->error_warning_limit_reg.val;
++    for (int i = 0; i < 4; i++) {
++        reg_save->acr_reg[i] = hw->acceptance_filter.acr[i].byte;
++        reg_save->amr_reg[i] = hw->acceptance_filter.amr[i].byte;
++    }
++    reg_save->rx_error_counter_reg = (uint8_t) hw->rx_error_counter_reg.val;
++    reg_save->tx_error_counter_reg = (uint8_t) hw->tx_error_counter_reg.val;
++    reg_save->clock_divider_reg = (uint8_t) hw->clock_divider_reg.val;
++}
++
++/**
++ * @brief   Restores the previous values of the controller's registers
++ * 
++ * @param hw Start address of the CAN registers
++ * @param reg_save Pointer to structure to storing register values to restore
++ * @note Must be called in reset mode so that config registers become accessible
++ * @note Some registers are read only thus cannot be restored
++ */
++static inline void can_ll_restore_reg(can_dev_t *hw, can_ll_reg_save_t *reg_save)
++{
++    hw->mode_reg.val = reg_save->mode_reg;
++    hw->interrupt_enable_reg.val = reg_save->interrupt_enable_reg;
++    hw->bus_timing_0_reg.val = reg_save->bus_timing_0_reg;
++    hw->bus_timing_1_reg.val = reg_save->bus_timing_1_reg;
++    hw->error_warning_limit_reg.val = reg_save->error_warning_limit_reg;
++    for (int i = 0; i < 4; i++) {
++        hw->acceptance_filter.acr[i].byte = reg_save->acr_reg[i];
++        hw->acceptance_filter.amr[i].byte = reg_save->amr_reg[i];
++    }
++    hw->rx_error_counter_reg.val = reg_save->rx_error_counter_reg;
++    hw->tx_error_counter_reg.val = reg_save->tx_error_counter_reg;
++    hw->clock_divider_reg.val = reg_save->clock_divider_reg;
++}
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/components/soc/esp32/include/soc/can_caps.h b/components/soc/esp32/include/soc/can_caps.h
+index 68073a3363..86f2855e0e 100644
+--- a/components/soc/esp32/include/soc/can_caps.h
++++ b/components/soc/esp32/include/soc/can_caps.h
+@@ -28,7 +28,48 @@ extern "C" {
+ #define CAN_BRP_IS_VALID(brp)       ((brp) >= 2 && (brp) <= 128 && ((brp) & 0x1) == 0)
+ #endif
+ 
+-//Todo: Add FIFO overrun errata workaround
++/* -------------------------- Errata Workarounds ---------------------------- */
++
++/**
++ * Errata: When a transmit interrupt occurs, and interrupt register is read on
++ * the same clock cycle, the transmit interrupt could be lost.
++ * Workaround: Check the STATUS_TRANSMIT_BUFFER bit each time the INTERRUPT_REG is read
++ */
++#define CAN_ERRATA_4_WORKAROUND             1
++
++/**
++ * Errata: Receiving an erroneous data frame can cause the data bytes of the next
++ * received data frame to be invalid.
++ * Workaround: Reset peripheral
++ */
++#define CAN_ERRATA_5_WORKAROUND             1
++
++/**
++ * Errata: When RX FIFO overruns and RX message counter maxes out (at 64 messages),
++ * any messages read from the RX buffer will be corrupt
++ * Workaround: Reset peripheral.
++ * 
++ * Workaround threshold set at 63 to prevent failure of detecting errata condition
++ */
++#define CAN_ERRATA_10_WORKAROUND            1
++#define CAN_ERRATA_10_WORKAROUND_THRESHOLD  63
++
++/**
++ * Errata: When the release buffer command is set, and at the same APB clock cycle
++ * an overrun byte is written into the RX FIFO, the RX FIFO's internal byte counter
++ * will not be decremented by the release buffer command.
++ * Workaround: Enter and exit reset mode
++ */
++#define CAN_ERRATA_11_WORKAROUND            1
++
++/**
++ * Some errata workarounds will require a hardware reset of the peripheral, thus
++ * requires the peripheral's registers to be saved and restored.
++ */
++#if defined(CAN_ERRATA_10_WORKAROUND)
++#define CAN_ERRATA_HW_RESET_PERIPH          1
++#endif
++
+ //Todo: Add ECC decode capabilities
+ //Todo: Add ALC decode capability
+ 
+diff --git a/components/soc/esp32/include/soc/can_struct.h b/components/soc/esp32/include/soc/can_struct.h
+index 7325cd5a32..7085c9dfaa 100644
+--- a/components/soc/esp32/include/soc/can_struct.h
++++ b/components/soc/esp32/include/soc/can_struct.h
+@@ -183,8 +183,8 @@ typedef volatile struct can_dev_s {
+     //Misc Registers
+     union {
+         struct {
+-            uint32_t rmc: 5;                    /* RMC[4:0] RX Message Counter */
+-            uint32_t reserved27: 27;            /* Internal Reserved */
++            uint32_t rmc: 7;                    /* RMC[6:0] RX Message Counter */
++            uint32_t reserved27: 25;            /* Internal Reserved */
+         };
+         uint32_t val;
+     } rx_message_counter_reg;                   /* Address 29 */
+diff --git a/components/soc/include/hal/can_hal.h b/components/soc/include/hal/can_hal.h
+index e723160722..9199e910ee 100644
+--- a/components/soc/include/hal/can_hal.h
++++ b/components/soc/include/hal/can_hal.h
+@@ -31,25 +31,56 @@ extern "C" {
+ 
+ /* ------------------------- Defines and Typedefs --------------------------- */
+ 
+-//Error active interrupt related
+-#define CAN_HAL_EVENT_BUS_OFF               (1 << 0)
+-#define CAN_HAL_EVENT_BUS_RECOV_CPLT        (1 << 1)
+-#define CAN_HAL_EVENT_BUS_RECOV_PROGRESS    (1 << 2)
+-#define CAN_HAL_EVENT_ABOVE_EWL             (1 << 3)
+-#define CAN_HAL_EVENT_BELOW_EWL             (1 << 4)
+-#define CAN_HAL_EVENT_ERROR_PASSIVE         (1 << 5)
+-#define CAN_HAL_EVENT_ERROR_ACTIVE          (1 << 6)
+-#define CAN_HAL_EVENT_BUS_ERR               (1 << 7)
+-#define CAN_HAL_EVENT_ARB_LOST              (1 << 8)
+-#define CAN_HAL_EVENT_RX_BUFF_FRAME         (1 << 9)
+-#define CAN_HAL_EVENT_TX_BUFF_FREE          (1 << 10)
++#define CAN_HAL_SET_FLAG(var, flag)         ((var) |= (flag))
++#define CAN_HAL_RESET_FLAG(var, flag)       ((var) &= ~(flag))
++
++//HAL state flags
++#define CAN_HAL_STATE_FLAG_RUNNING          (1 << 0)    //Controller is active (not in reset mode)
++#define CAN_HAL_STATE_FLAG_RECOVERING       (1 << 1)    //Bus is undergoing bus recovery
++#define CAN_HAL_STATE_FLAG_ERR_WARN         (1 << 2)    //TEC or REC is >= error warning limit
++#define CAN_HAL_STATE_FLAG_ERR_PASSIVE      (1 << 3)    //TEC or REC is >= 128
++#define CAN_HAL_STATE_FLAG_BUS_OFF          (1 << 4)    //Bus-off due to TEC >= 256
++#define CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED (1 << 5)    //Transmit buffer is occupied
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++#define CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET (1 << 6)    //Peripheral was reset on entry to ISR due to errata
++#define CAN_HAL_STATE_FLAG_TX_RETRY         (1 << 7)    //Peripheral reset has cancelled a pending TX that needs to be retried
++#endif
++#ifdef CAN_ERRATA_11_WORKAROUND
++#define CAN_HAL_STATE_FLAG_TX_INTR_MISS     (1 << 8)    //Workaround has caused TX buffer free interrupt to be cleared
++#endif
++
++//Interrupt Events
++#define CAN_HAL_EVENT_BUS_OFF               (1 << 0)    //Bus-off has occurred
++#define CAN_HAL_EVENT_BUS_RECOV_CPLT        (1 << 1)    //Bus-off recovery has been completed
++#define CAN_HAL_EVENT_BUS_RECOV_PROGRESS    (1 << 2)    //Bus-recovery in progress. TEC has dropped below error warning limit
++#define CAN_HAL_EVENT_ABOVE_EWL             (1 << 3)    //TEC or REC surpassed error warning limit
++#define CAN_HAL_EVENT_BELOW_EWL             (1 << 4)    //TEC and REC are both below error warning
++#define CAN_HAL_EVENT_ERROR_PASSIVE         (1 << 5)    //Entered error passive
++#define CAN_HAL_EVENT_ERROR_ACTIVE          (1 << 6)    //Returned to error active
++#define CAN_HAL_EVENT_BUS_ERR               (1 << 7)    //A bus error has occurred
++#define CAN_HAL_EVENT_ARB_LOST              (1 << 8)    //Arbitration was lost
++#define CAN_HAL_EVENT_RX_BUFF_FRAME         (1 << 9)    //One or more frames are in the RX FIFO
++#define CAN_HAL_EVENT_TX_BUFF_FREE          (1 << 10)   //TX buffer is free (transmission completed)
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++#define CAN_HAL_EVENT_ERRATA_NEED_RESET     (1 << 11)   //Errata has caused the peripheral to require a reset
++#endif
++
++
++typedef can_ll_frame_buffer_t can_hal_frame_t;
+ 
+ typedef struct {
+     can_dev_t *dev;
++    uint32_t state_flags;
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++    //Space to store state and configuration when resetting peripheral
++    can_ll_reg_save_t reg_save;
++    uint8_t alc_reg;
++    uint8_t ecc_reg;
++    uint8_t rx_msg_cnt_reg;
++    can_hal_frame_t current_tx_frame;
++#endif
+ } can_hal_context_t;
+ 
+-typedef can_ll_frame_buffer_t can_hal_frame_t;
+-
+ /* ---------------------------- Init and Config ----------------------------- */
+ 
+ /**
+@@ -116,6 +147,7 @@ bool can_hal_stop(can_hal_context_t *hal_ctx);
+  */
+ static inline bool can_hal_start_bus_recovery(can_hal_context_t *hal_ctx)
+ {
++    CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_RECOVERING);
+     return can_ll_exit_reset_mode(hal_ctx->dev);
+ }
+ 
+@@ -163,26 +195,53 @@ static inline bool can_hal_check_last_tx_successful(can_hal_context_t *hal_ctx)
+     return can_ll_is_last_tx_successful((hal_ctx)->dev);
+ }
+ 
++/**
++ * @brief Check if certain HAL state flags are set
++ * 
++ * The HAL will maintain a record of the controller's state via a set of flags.
++ * These flags are automatically maintained (i.e., set and reset) inside various
++ * HAL function calls. This function checks if certain flags are currently set.
++ * 
++ * @param hal_ctx Context of the HAL layer
++ * @param check_flags Bit mask of flags to check
++ * @return True if one or more of the flags in check_flags are set
++ */
++static inline bool can_hal_check_state_flags(can_hal_context_t *hal_ctx, uint32_t check_flags)
++{
++    return hal_ctx->state_flags & check_flags;
++}
++
+ /* ----------------------------- Event Handling ----------------------------- */
+ 
+ /**
+- * @brief Decode current events that triggered an interrupt
++ * @brief Prepare for interrupt service routine 
+  *
+- * This function should be called on every CAN interrupt. It will read (and
+- * thereby clear) the interrupt register, then determine what events have
+- * occurred to trigger the interrupt.
++ * This function should be the called at the beginning of an ISR. This
++ * function will do the following:
++ * - Read and clear interrupts
++ * - Decode current events that triggered an interrupt
++ * - Check if errata conditions require a reset.
+  *
+  * @param hal_ctx Context of the HAL layer
+- * @param bus_recovering Whether the CAN peripheral was previous undergoing bus recovery
+  * @return Bit mask of events that have occurred
+  */
+-uint32_t can_hal_decode_interrupt_events(can_hal_context_t *hal_ctx, bool bus_recovering);
++uint32_t can_hal_isr_entry(can_hal_context_t *hal_ctx);
++
++/**
++ * @brief Prepare to exit an interrupt service routine
++ * 
++ * This function should be called at the end of an ISR. It will handle any
++ * updating of the HAL's internal state
++ * 
++ * @param hal_ctx Context of the HAL layer
++ */
++void can_hal_isr_exit(can_hal_context_t *hal_ctx);
+ 
+ /**
+  * @brief Handle bus recovery complete
+  *
+  * This function should be called on an bus recovery complete event. It simply
+- * enters reset mode to stop bus activity.
++ * enters reset mode to stop bus activity and resets the HAl state flags.
+  *
+  * @param hal_ctx Context of the HAL layer
+  * @return True if successfully handled bus recovery completion, false otherwise.
+@@ -202,33 +261,54 @@ static inline bool can_hal_handle_bus_recov_cplt(can_hal_context_t *hal_ctx)
+  */
+ static inline void can_hal_handle_arb_lost(can_hal_context_t *hal_ctx)
+ {
+-    can_ll_clear_arb_lost_cap((hal_ctx)->dev);
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++    if (!(hal_ctx->state_flags & CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET)) {
++        (void) can_ll_get_arb_lost_cap((hal_ctx)->dev);
++    }
++#else
++    (void) can_ll_get_arb_lost_cap((hal_ctx)->dev);
++#endif
+ }
+ 
+ /**
+  * @brief Handle bus error
+  *
+- * This function should be called on an bus error event. It simply clears
+- * the clears the ECC register.
++ * This function should be called on a bus error event. It reads and decodes the
++ * details regarding the bus error stored in the ECC register. When the ECC
++ * register is read, it is automatically cleared and the bus error interrupt
++ * re-armed.
+  *
+  * @param hal_ctx Context of the HAL layer
++ * 
+  */
+ static inline void can_hal_handle_bus_error(can_hal_context_t *hal_ctx)
+ {
+-    can_ll_clear_err_code_cap((hal_ctx)->dev);
++#ifdef CAN_ERRATA_5_WORKAROUND
++    if (!(hal_ctx->state_flags & CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET)) {
++        (void) can_ll_get_err_code_cap((hal_ctx)->dev);
++    }
++#else
++    (void) can_ll_get_err_code_cap((hal_ctx)->dev);
++#endif
+ }
+ 
+ /**
+  * @brief Handle BUS OFF
+  *
+- * This function should be called on a BUS OFF event. It simply changes the
+- * mode to LOM to freeze REC
++ * This function should be called on a BUS OFF event. Mode is set to LOM to
++ * freeze both error counters. It's also possible that REC would have increased
++ * before this handler is able to run. Therefore, set TEC to 0 to reset both TEC
++ * and REC to 0, then reset TEC to 255 to retrigger the Bus OFF condition. Then
++ * clear the re-triggered BUS OFF interrupt.
+  *
+  * @param hal_ctx Context of the HAL layer
+  */
+ static inline void can_hal_handle_bus_off(can_hal_context_t *hal_ctx)
+ {
+-    can_ll_set_mode((hal_ctx)->dev, CAN_MODE_LISTEN_ONLY);
++    can_ll_set_mode(hal_ctx->dev, CAN_MODE_LISTEN_ONLY);
++    can_ll_set_tec(hal_ctx->dev, 0);
++    can_ll_set_tec(hal_ctx->dev, 255);
++    (void) can_ll_get_and_clear_intrs(hal_ctx->dev);    //Clear the re-triggered BUS OFF interrupt
+ }
+ 
+ /* ------------------------------- TX and RX -------------------------------- */
+@@ -280,25 +360,81 @@ void can_hal_set_tx_buffer_and_transmit(can_hal_context_t *hal_ctx, can_hal_fram
+ /**
+  * @brief Copy a frame from the RX buffer and release
+  *
+- * This function copies a frame from the RX buffer, then release the buffer (so
+- * that it loads the next frame in the RX FIFO).
++ * If the RX buffer points a valid frame (i.e., not overrun), this function
++ * will copy the RX buffer, then release the buffer (so that it loads the next
++ * frame in the RX FIFO). If the RX buffer points to an overrun frame, it indicates
++ * that the RX FIFO contains one or more overurn frames which should be cleared.
+  *
+  * @param hal_ctx Context of the HAL layer
+- * @param rx_frame Pointer to structure to store RX frame
++ * @param rx_frame Pointer to structure tostore RX frame
++ * @return True if frame was copied and RX buffer released. False if RX buffer
++ *         points to overrun frame.
+  */
+-static inline void can_hal_read_rx_buffer_and_clear(can_hal_context_t *hal_ctx, can_hal_frame_t *rx_frame)
++static inline bool can_hal_read_rx_buffer_and_clear(can_hal_context_t *hal_ctx, can_hal_frame_t *rx_frame)
+ {
++    if (can_ll_get_status(hal_ctx->dev) & CAN_LL_STATUS_DOS) {
++        //RX buffer points to an overrun frame in the RX FIFO
++        return false;
++    }
+     can_ll_get_rx_buffer(hal_ctx->dev, rx_frame);
+     can_ll_set_cmd_release_rx_buffer(hal_ctx->dev);
+-    /*
+-     * Todo: Support overrun handling by:
+-     * - Check overrun status bit. Return false if overrun
+-     */
++    return true;
++}
++
++/**
++ * @brief Clear the RX FIFO of all overrun frames
++ * 
++ * Clears all overrun frames from the RX FIFO.
++ * 
++ * @param hal_ctx Context of the HAL layer
++ * @return The number of overrun frames cleared from RX FIFO
++ */
++static inline uint32_t can_hal_clear_rx_fifo_overrun(can_hal_context_t *hal_ctx)
++{
++    uint32_t msg_count = can_ll_get_rx_msg_count(hal_ctx->dev);
++    //Release RX buffer "msg_count" iterations so that all overurn frames are cleared
++    for (int i = 0; i < msg_count; i++) {
++        can_ll_set_cmd_release_rx_buffer(hal_ctx->dev);
++    }
++    can_ll_set_cmd_clear_data_overrun(hal_ctx->dev);
++    return msg_count;
+ }
+ 
++/* --------------------------- Errata Workaround ---------------------------- */
++
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++/**
++ * @brief Prepare for a hardware reset
++ * 
++ * Prepare for a hardware reset by saving stopping the controller and saving
++ * registers. Hardware reset is required for errata workarounds.
++ * 
++ * @param hal_ctx Context of the HAL layer
++ */
++void can_hal_prepare_for_hw_reset(can_hal_context_t *hal_ctx, uint32_t events);
++
++/**
++ * @brief Recover from a hardware reset
++ * 
++ * Recover from a hardware reset by restoring registers, restarting the
++ * controller, and resuming an transmission halted by the reset.
++ * 
++ * @param hal_ctx Context of the HAL layer
++ */
++void can_hal_recover_from_hw_reset(can_hal_context_t *hal_ctx);
++#endif
+ 
+-//Todo: Decode ALC register
+-//Todo: Decode error code capture
++#ifdef CAN_ERRATA_11_WORKAROUND
++/**
++ * @brief Errata 11 workaround
++ * 
++ * Call this function to workaround errata 11. This function will enter then 
++ * exit reset mode in order. Any ongoing transmission will be restarted.
++ * 
++ * @param hal_ctx Context of the HAL layer
++ */
++void can_hal_errata_11_workaround(can_hal_context_t *hal_ctx);
++#endif
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/components/soc/src/hal/can_hal.c b/components/soc/src/hal/can_hal.c
+index 4a0da8025e..a170033a3e 100644
+--- a/components/soc/src/hal/can_hal.c
++++ b/components/soc/src/hal/can_hal.c
+@@ -12,9 +12,9 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-//Todo: Place the implementation of all common HAL functions here
+-
+ #include <stddef.h>
++#include <string.h>
++#include <assert.h>
+ #include "hal/can_hal.h"
+ 
+ //Default values written to various registers on initialization
+@@ -22,10 +22,13 @@
+ #define CAN_HAL_INIT_REC    0
+ #define CAN_HAL_INIT_EWL    96
+ 
++/* ---------------------------- Init and Config ----------------------------- */
++
+ bool can_hal_init(can_hal_context_t *hal_ctx)
+ {
+     //Initialize HAL context
+     hal_ctx->dev = &CAN;
++    hal_ctx->state_flags = 0;
+     //Initialize CAN controller, and set default values to registers
+     if (!can_ll_enter_reset_mode(hal_ctx->dev)) {    //Must enter reset mode to write to config registers
+         return false;
+@@ -44,8 +47,8 @@ void can_hal_deinit(can_hal_context_t *hal_ctx)
+     //Clear any pending registers
+     (void) can_ll_get_and_clear_intrs(hal_ctx->dev);
+     can_ll_set_enabled_intrs(hal_ctx->dev, 0);
+-    can_ll_clear_arb_lost_cap(hal_ctx->dev);
+-    can_ll_clear_err_code_cap(hal_ctx->dev);
++    (void) can_ll_get_arb_lost_cap(hal_ctx->dev);
++    (void) can_ll_get_err_code_cap(hal_ctx->dev);
+     hal_ctx->dev = NULL;
+ }
+ 
+@@ -59,11 +62,14 @@ void can_hal_configure(can_hal_context_t *hal_ctx, const can_timing_config_t *t_
+     (void) can_ll_get_and_clear_intrs(hal_ctx->dev);    //Clear any latched interrupts
+ }
+ 
++/* -------------------------------- Actions --------------------------------- */
++
+ bool can_hal_start(can_hal_context_t *hal_ctx, can_mode_t mode)
+ {
+     can_ll_set_mode(hal_ctx->dev, mode);                //Set operating mode
+-    //Todo: Check if this can be removed
+     (void) can_ll_get_and_clear_intrs(hal_ctx->dev);    //Clear any latched interrupts
++    CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_RUNNING);
++    can_ll_set_cmd_clear_data_overrun(hal_ctx->dev);
+     return can_ll_exit_reset_mode(hal_ctx->dev);        //Return false if failed to exit reset mode
+ }
+ 
+@@ -72,13 +78,17 @@ bool can_hal_stop(can_hal_context_t *hal_ctx)
+     if (!can_ll_enter_reset_mode(hal_ctx->dev)) {
+         return false;
+     }
+-    //Todo: Check if this can be removed
+     (void) can_ll_get_and_clear_intrs(hal_ctx->dev);
+     can_ll_set_mode(hal_ctx->dev, CAN_MODE_LISTEN_ONLY);    //Freeze REC by changing to LOM mode
++    //Any TX is immediately halted on entering reset mode
++    CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED);
++    CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_RUNNING);
+     return true;
+ }
+ 
+-uint32_t can_hal_decode_interrupt_events(can_hal_context_t *hal_ctx, bool bus_recovering)
++/* ----------------------------- Event Handling ----------------------------- */
++
++uint32_t can_hal_isr_entry(can_hal_context_t *hal_ctx)
+ {
+     uint32_t events = 0;
+     //Read interrupt, status
+@@ -86,33 +96,64 @@ uint32_t can_hal_decode_interrupt_events(can_hal_context_t *hal_ctx, bool bus_re
+     uint32_t status = can_ll_get_status(hal_ctx->dev);
+     uint32_t tec = can_ll_get_tec(hal_ctx->dev);
+     uint32_t rec = can_ll_get_rec(hal_ctx->dev);
++    uint32_t rx_msg_count = can_ll_get_rx_msg_count(hal_ctx->dev);
+ 
+     //Receive Interrupt set whenever RX FIFO  is not empty
+     if (interrupts & CAN_LL_INTR_RI) {
++#ifdef CAN_ERRATA_10_WORKAROUND     //Check for errata 10 condition
++        if (rx_msg_count >= CAN_ERRATA_10_WORKAROUND_THRESHOLD) {
++            events |= CAN_HAL_EVENT_ERRATA_NEED_RESET;
++        }
++#endif
+         events |= CAN_HAL_EVENT_RX_BUFF_FRAME;
+     }
+     //Transmit interrupt set whenever TX buffer becomes free
++#ifdef CAN_ERRATA_4_WORKAROUND      //Check for errata 4 condition
++    if ((status & CAN_LL_STATUS_TBS) && ((interrupts & CAN_LL_INTR_TI) || (hal_ctx->state_flags & CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED))) {
++#else
+     if (interrupts & CAN_LL_INTR_TI) {
++#endif
+         events |= CAN_HAL_EVENT_TX_BUFF_FREE;
++        CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED);
+     }
+     //Error Warning Interrupt set whenever Error or Bus Status bit changes
+     if (interrupts & CAN_LL_INTR_EI) {
+         if (status & CAN_LL_STATUS_BS) {
+             //Currently in BUS OFF state
+-            //EWL is exceeded, thus must have entered BUS OFF
+-            //Below EWL. Therefore TEC is counting down in bus recovery
+-            events |= (status & CAN_LL_STATUS_ES) ? CAN_HAL_EVENT_BUS_OFF : CAN_HAL_EVENT_BUS_RECOV_PROGRESS;
++            if (status & CAN_LL_STATUS_ES) {    //EWL is exceeded, thus must have entered BUS OFF
++                events |= CAN_HAL_EVENT_BUS_OFF;
++                //Any TX would have been halted by entering bus off. Reset its flag
++                CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED);
++                CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_BUS_OFF);
++            } else {
++                //Below EWL. Therefore TEC is counting down in bus recovery
++                events |= CAN_HAL_EVENT_BUS_RECOV_PROGRESS;
++            }
+         } else {
+             //Not in BUS OFF
+-            events |= (status & CAN_LL_STATUS_ES) ? CAN_HAL_EVENT_ABOVE_EWL :   //Just Exceeded EWL
+-                      ((bus_recovering) ?  //If previously undergoing bus recovery
+-                      CAN_HAL_EVENT_BUS_RECOV_CPLT :
+-                      CAN_HAL_EVENT_BELOW_EWL);
++            if (status & CAN_LL_STATUS_ES) {
++                events |= CAN_HAL_EVENT_ABOVE_EWL;  //Just Exceeded EWL
++                CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_ERR_WARN);
++            } else if (hal_ctx->state_flags & CAN_HAL_STATE_FLAG_RECOVERING) {
++                //Previously undergoing bus recovery
++                events |= CAN_HAL_EVENT_BUS_RECOV_CPLT;
++                CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_RECOVERING);
++                CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_BUS_OFF);
++            } else {
++                events |= CAN_HAL_EVENT_BELOW_EWL;
++                CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_ERR_WARN);
++            }
+         }
+     }
+     //Error Passive Interrupt on transition from error active to passive or vice versa
+     if (interrupts & CAN_LL_INTR_EPI) {
+-        events |= (tec >= CAN_ERR_PASS_THRESH || rec >= CAN_ERR_PASS_THRESH) ? CAN_HAL_EVENT_ERROR_PASSIVE : CAN_HAL_EVENT_ERROR_ACTIVE;
++        if (tec >= CAN_ERR_PASS_THRESH || rec >= CAN_ERR_PASS_THRESH) {
++            events |= CAN_HAL_EVENT_ERROR_PASSIVE;
++            CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_ERR_PASSIVE);
++        } else {
++            events |= CAN_HAL_EVENT_ERROR_ACTIVE;
++            CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_ERR_PASSIVE);
++        }
+     }
+     //Arbitration Lost Interrupt triggered on losing arbitration
+     if (interrupts & CAN_LL_INTR_ALI) {
+@@ -120,11 +161,31 @@ uint32_t can_hal_decode_interrupt_events(can_hal_context_t *hal_ctx, bool bus_re
+     }
+     //Bus error interrupt triggered on a bus error (e.g. bit, ACK, stuff etc)
+     if (interrupts & CAN_LL_INTR_BEI) {
++#ifdef CAN_ERRATA_5_WORKAROUND      //Check for errata 5 condition
++        can_ll_err_type_t type;
++        can_ll_err_dir_t dir;
++        can_ll_err_seg_t seg;
++        uint32_t ecc = can_ll_get_err_code_cap(hal_ctx->dev);
++        can_ll_decode_err_code_cap(ecc, &type, &dir, &seg);
++        if (dir == CAN_LL_ERR_DIR_RX && (seg == CAN_LL_ERR_SEG_DATA || seg == CAN_LL_ERR_SEG_CRC_SEQ || (seg == CAN_LL_ERR_SEG_ACK_DELIM && type == CAN_LL_ERR_OTHER))) {
++            events |= CAN_HAL_EVENT_ERRATA_NEED_RESET;
++        }
++        hal_ctx->ecc_reg = (uint8_t)ecc;
++#endif
+         events |= CAN_HAL_EVENT_BUS_ERR;
+     }
++
+     return events;
+ }
+ 
++void can_hal_isr_exit(can_hal_context_t *hal_ctx)
++{
++    CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET);
++    CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_INTR_MISS);
++}
++
++/* ------------------------------- TX and RX -------------------------------- */
++
+ void can_hal_set_tx_buffer_and_transmit(can_hal_context_t *hal_ctx, can_hal_frame_t *tx_frame)
+ {
+     //Copy frame into tx buffer
+@@ -141,4 +202,68 @@ void can_hal_set_tx_buffer_and_transmit(can_hal_context_t *hal_ctx, can_hal_fram
+     } else {
+         can_ll_set_cmd_tx(hal_ctx->dev);
+     }
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++    //Save current TX frame in case peripheral is reset at any time
++    memcpy(&hal_ctx->current_tx_frame, tx_frame, sizeof(can_hal_frame_t));
++#endif
++    CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED);
++}
++
++/* --------------------------- Errata Workaround ---------------------------- */
++
++#ifdef CAN_ERRATA_HW_RESET_PERIPH
++void can_hal_prepare_for_hw_reset(can_hal_context_t *hal_ctx, uint32_t events)
++{
++    //Check if a on going transmission will be cancelled by hardware reset
++    if (!(events & CAN_HAL_EVENT_TX_BUFF_FREE) && !(can_ll_get_status(hal_ctx->dev) & CAN_LL_STATUS_TBS)) {
++        CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_RETRY);
++    }
++    //Some register must read and saved before enetering reset mode
++    hal_ctx->alc_reg = (uint8_t) can_ll_get_arb_lost_cap(hal_ctx->dev);
++    hal_ctx->rx_msg_cnt_reg = (uint8_t) can_ll_get_rx_msg_count(hal_ctx->dev);
++#ifndef CAN_ERRATA_5_WORKAROUND
++    //Errata 5 workaround would already have read this register
++    hal_ctx->ecc_reg = (uint8_t) can_ll_get_err_code_cap(hal_ctx->dev);
++#endif
++    //Enter reset mode to stop controller.
++    can_ll_enter_reset_mode(hal_ctx->dev);
++    //Save remaining registers after stopping
++    can_ll_save_reg(hal_ctx->dev, &hal_ctx->reg_save);
++}
++
++void can_hal_recover_from_hw_reset(can_hal_context_t *hal_ctx)
++{
++    can_ll_enter_reset_mode(hal_ctx->dev);
++    can_ll_enable_extended_reg_layout(hal_ctx->dev);
++    can_ll_restore_reg(hal_ctx->dev, &hal_ctx->reg_save);
++    can_ll_exit_reset_mode(hal_ctx->dev);
++    (void) can_ll_get_and_clear_intrs(hal_ctx->dev);    //Clear any latched interrupts
++    if (hal_ctx->state_flags & CAN_HAL_STATE_FLAG_TX_RETRY) {
++        //Retry cancelled transmissions due to the reset
++        can_hal_set_tx_buffer_and_transmit(hal_ctx, &hal_ctx->current_tx_frame);
++        CAN_HAL_RESET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_RETRY);
++    }
++    CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_PERIPH_WAS_RESET);
++}
++#endif
++
++#ifdef CAN_ERRATA_11_WORKAROUND
++void can_hal_errata_11_workaround(can_hal_context_t *hal_ctx)
++{
++    bool retry_tx = false;
++    if (can_hal_check_state_flags(hal_ctx, CAN_HAL_STATE_FLAG_TX_BUFF_OCCUPIED)) {
++        if (can_ll_get_status(hal_ctx->dev) & CAN_LL_STATUS_TBS) {
++            //If TX completed betwen ISR entry and now, entering reset mode will clear
++            //that interrupt. So we set a flag here.
++            CAN_HAL_SET_FLAG(hal_ctx->state_flags, CAN_HAL_STATE_FLAG_TX_INTR_MISS);
++        } else {
++            retry_tx = true;
++        }
++    }
++    can_ll_enter_reset_mode(hal_ctx->dev);
++    can_ll_exit_reset_mode(hal_ctx->dev);
++    if (retry_tx) {
++        can_hal_set_tx_buffer_and_transmit(hal_ctx, &hal_ctx->current_tx_frame);
++    }
+ }
++#endif
+\ No newline at end of file
+-- 
+2.17.1
+

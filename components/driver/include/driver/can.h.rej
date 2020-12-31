@@ -1,0 +1,23 @@
+diff a/components/driver/include/driver/can.h b/components/driver/include/driver/can.h	(rejected hunks)
+@@ -68,9 +68,11 @@ extern "C" {
+ #define CAN_ALERT_RX_QUEUE_FULL         0x0400      /**< Alert(1024): The RX queue is full causing a frame to be lost */
+ #define CAN_ALERT_ERR_PASS              0x0800      /**< Alert(2048): CAN controller has become error passive */
+ #define CAN_ALERT_BUS_OFF               0x1000      /**< Alert(4096): Bus-off condition occurred. CAN controller can no longer influence bus */
+-#define CAN_ALERT_ALL                   0x1FFF      /**< Bit mask to enable all alerts during configuration */
++#define CAN_ALERT_RX_FIFO_OVERRUN       0x2000      /**< Alert(8192): An RX FIFO overrun has occurred */
++#define CAN_ALERT_PERIPH_RESET          0x4000      /**< Alert(16384): The CAN controller was reset */
++#define CAN_ALERT_ALL                   0x7FFF      /**< Bit mask to enable all alerts during configuration */
+ #define CAN_ALERT_NONE                  0x0000      /**< Bit mask to disable all alerts during configuration */
+-#define CAN_ALERT_AND_LOG               0x2000      /**< Bit mask to enable alerts to also be logged when they occur */
++#define CAN_ALERT_AND_LOG               0x8000      /**< Bit mask to enable alerts to also be logged when they occur */
+ 
+ /** @endcond */
+ 
+@@ -116,6 +118,7 @@ typedef struct {
+     uint32_t rx_error_counter;      /**< Current value of Receive Error Counter */
+     uint32_t tx_failed_count;       /**< Number of messages that failed transmissions */
+     uint32_t rx_missed_count;       /**< Number of messages that were lost due to a full RX queue */
++    uint32_t rx_overrun_count;       /**< Number of messages that were lost due to a RX FIFO overrun */
+     uint32_t arb_lost_count;        /**< Number of instances arbitration was lost */
+     uint32_t bus_error_count;       /**< Number of instances a bus error has occurred */
+ } can_status_info_t;
